@@ -1,0 +1,32 @@
+# Taken verbatim from upstream openwrt/packages net/strongswan/Config.in
+#
+# Only the STRONGSWAN_* build options live here. The PACKAGE_strongswan-*
+# entries are auto-generated from the Makefile by
+# scripts/package-metadata.pl into tmp/.config-package.in — declaring them
+# again in this file produced a wall of
+#   "warning: ignoring type redefinition of 'PACKAGE_strongswan-*'"
+# during `make defconfig`.
+
+if PACKAGE_strongswan
+comment "Configuration"
+
+# --with-routing-table
+config STRONGSWAN_ROUTING_TABLE
+	string
+	prompt "Set the IPsec routing table ID"
+	default "220"
+
+#  --with-routing-table-prio
+config STRONGSWAN_ROUTING_TABLE_PRIO
+	string
+	prompt "Set the IPsec routing table priority"
+	default "220"
+
+config STRONGSWAN_INCLUDE_INSECURE
+	bool
+	prompt "Include cryptographically weak protocols"
+	default !PACKAGE_libopenssl
+
+comment "Packages"
+
+endif

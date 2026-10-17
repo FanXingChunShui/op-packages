@@ -1,0 +1,39 @@
+# OpenWrt build artifacts
+bin/
+build_dir/
+staging_dir/
+tmp/
+dl/
+logs/
+.feed/
+
+# SDK build
+*.ipk
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+
+# Test artifacts
+tests/artifacts/
+tests/.qemu-*
+*.core
+*.img
+*.qcow2
+
+# CI
+.coverage
+htmlcov/
+.pytest_cache/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local config
+.env
+.env.local
+.openbitfun/
+/.openbitfun/search/flashgrep-index/

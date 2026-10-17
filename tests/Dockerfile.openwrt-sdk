@@ -1,0 +1,75 @@
+# OpenWrt 25.12 SDK image for compiling op-packages
+#
+# This image provides a reproducible build environment for all packages
+# in this feed. It is based on Debian Bookworm with the official OpenWrt
+# SDK extracted for x86_64 (the smallest, fastest-to-build architecture).
+#
+# Build:
+#   docker build -t op-packages-sdk -f tests/Dockerfile.openwrt-sdk .
+#
+# Use:
+#   docker run --rm -v $(pwd):/src op-packages-sdk \
+#       ./tests/scripts/build-all.sh
+
+FROM debian:bookworm-slim
+
+ARG SDK_URL=https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/
+ARG SDK_FILE=openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Install build prerequisites (matching OpenWrt buildsystem docs)
+# https://openwrt.org/docs/guide-developer/build-system/install-buildsystem
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        cpio \
+        file \
+        g++ \
+        gcc \
+        git \
+        gnupg \
+        libncurses-dev \
+        libssl-dev \
+        python3 \
+        python3-distutils \
+        python3-pyelftools \
+        rsync \
+        unzip \
+        wget \
+        xz-utils \
+        zlib1g-dev \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and extract the OpenWrt 25.12.5 SDK.
+# Note: starting with OpenWrt 23.05 the SDK tarball is .tar.zst (zstd-compressed),
+# not .tar.xz. We keep wget's output on failure for visibility.
+WORKDIR /opt
+RUN set -eux; \
+    cd /opt; \
+    wget "${SDK_URL}${SDK_FILE}"; \
+    tar -I zstd -xf "${SDK_FILE}"; \
+    rm -f "${SDK_FILE}"; \
+    mv openwrt-sdk-* openwrt-sdk; \
+    ls -la /opt/openwrt-sdk/
+
+# Default working directory matches the entrypoint expectations
+WORKDIR /src
+
+# Make feeds directory writable for the build scripts
+RUN mkdir -p /opt/openwrt-sdk/feeds && chmod -R 777 /opt/openwrt-sdk/feeds
+
+# Default config: enable only the things our packages need (small footprint)
+# and disable kernel build (SDK is for package compilation only)
+COPY tests/configs/sdk-minimal.config /opt/openwrt-sdk/.config
+RUN cd /opt/openwrt-sdk && \
+    ./scripts/feeds update -i && \
+    ./scripts/feeds install -a
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["./tests/scripts/build-all.sh"]

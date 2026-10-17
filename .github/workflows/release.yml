@@ -1,0 +1,112 @@
+name: Release
+
+# Release automation for op-packages
+#   Trigger: push of a tag matching 'v*' (e.g. v1.0.0)
+#   Steps:
+#     1. Reuse the CI pipeline (static + build + verify) — same workflow the
+#        branch builds use, so a tag can never publish something CI did not
+#        build.
+#     2. Collect all .apk artifacts (OpenWrt 25.12 / apk-tools v3)
+#     3. Create a GitHub Release with the .apk files + SHA256SUMS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0). Defaults to current commit if blank.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Reuse the CI pipeline: build + verify everything
+  # ═══════════════════════════════════════════════════════════════════════
+  build:
+    name: Build & verify all packages
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+    permissions:
+      contents: read
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Create GitHub Release with all .apk assets
+  # ═══════════════════════════════════════════════════════════════════════
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+              TAG="${GITHUB_REF#refs/tags/}"
+          else
+              TAG="${{ inputs.tag }}"
+              if [ -z "$TAG" ]; then
+                  TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo 'untagged')"
+              fi
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing tag: ${TAG}"
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/apk
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Inventory
+        run: |
+          set -euo pipefail
+          find dist/apk -type f -name '*.apk' -printf '%f\n' | sort
+          echo
+          count="$(find dist/apk -type f -name '*.apk' | wc -l)"
+          echo "collected ${count} .apk files"
+          [ "${count}" -gt 0 ] || { echo "ERROR: no .apk files collected"; exit 1; }
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist/apk
+          sha256sum -- *.apk > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate changelog from git history
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PREV_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then
+              {
+                  echo "## Changes since ${PREV_TAG}"
+                  echo ""
+                  git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD"
+              } > dist/CHANGELOG.md
+          else
+              echo "## Initial release" > dist/CHANGELOG.md
+          fi
+          cat dist/CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: op-packages ${{ steps.tag.outputs.tag }}
+          body_path: dist/CHANGELOG.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/apk/*.apk
+            dist/apk/SHA256SUMS
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-rc') || contains(steps.tag.outputs.tag, '-beta') }}

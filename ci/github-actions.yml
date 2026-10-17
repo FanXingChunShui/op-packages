@@ -1,0 +1,102 @@
+name: op-packages CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly: rebuild against the latest OpenWrt SDK to catch upstream breakage
+    - cron: '0 6 * * 1'
+
+env:
+  OPENWRT_VERSION: '25.12.5'
+  SDK_IMAGE: 'op-packages-sdk:latest'
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1: static checks (no Docker required, runs in seconds)
+  # ───────────────────────────────────────────────────────────────────────
+  static-checks:
+    name: Static checks (Makefile syntax, shellcheck, dep audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run all static checks
+        run: ./tests/run-tests.sh all
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2: SDK build matrix (one job per package family)
+  # ───────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (Docker SDK, ${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: static-checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: libreswan
+            pkg: libreswan
+          - name: strongswan (default profile)
+            pkg: strongswan-default
+          - name: openvpn (openssl)
+            pkg: openvpn-openssl
+          - name: openvpn (mbedtls)
+            pkg: openvpn-mbedtls
+          - name: openvpn-easy-rsa
+            pkg: openvpn-easy-rsa
+          - name: softethervpn (server)
+            pkg: softethervpn-server
+          - name: softethervpn5 (server)
+            pkg: softethervpn5-server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the SDK Docker image
+        run: ./tests/run-tests.sh docker
+
+      - name: Compile ${{ matrix.pkg }}
+        run: |
+          docker run --rm \
+              -v "$(pwd):/src" \
+              -e "BUILD_PKG=${{ matrix.pkg }}" \
+              "${{ env.SDK_IMAGE }}" \
+              bash -c '
+                  set -e
+                  ln -sfn /src/net /opt/openwrt-sdk/package/op-packages
+                  cd /opt/openwrt-sdk
+                  ./scripts/feeds update -i
+                  ./scripts/feeds install op-packages
+                  make package/op-packages/op-packages/${BUILD_PKG}/compile V=s 2>&1 \
+                      | tee /src/tests/artifacts/${BUILD_PKG}-build.log \
+                      | tail -40
+              '
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.pkg }}
+          path: tests/artifacts/${{ matrix.pkg }}-build.log
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 3: weekly upstream-watch (only on schedule)
+  # ───────────────────────────────────────────────────────────────────────
+  upstream-watch:
+    name: Upstream version check (weekly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    needs: static-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream latest versions
+        run: ./tests/scripts/upstream-check.sh
+        continue-on-error: true

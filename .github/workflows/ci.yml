@@ -1,0 +1,527 @@
+name: CI
+
+# Continuous Integration for op-packages
+#
+# Target: OpenWrt 25.12.5, apk-tools v3 (.apk), x86/64.
+#
+# Architecture (no Docker — uses the GitHub hosted runner natively):
+#   1. Static checks      — shellcheck / Makefile syntax / hash audit
+#   2. Build matrix      — one job per *package directory* (6 jobs).
+#                          Each job boots the official 25.12.5 SDK, wires up
+#                          the feeds, compiles the directory and verifies the
+#                          produced .apk files with the SDK's own host `apk`.
+#   3. Verify .apk       — re-verifies every artifact in one place
+#   4. Upstream watch    — weekly
+#   5. Summary
+#
+# Why one job per *directory* instead of per package:
+#   softethervpn and softethervpn5 each emit four .apk files (base/libs,
+#   server, bridge, client) out of a single source build. Compiling them
+#   four times was pure duplication, so those collapse to one job each and
+#   the artifacts are simply all collected from bin/packages/.
+#
+#   openvpn is the same shape: one source tree, three mutually-exclusive
+#   SSL backends selected through the per-directory variant mechanism.
+#   A single directory compile emits openvpn-openssl, openvpn-mbedtls and
+#   openvpn-wolfssl, so it is one job too. Do not reintroduce per-variant
+#   jobs by passing BUILD_VARIANT= on the make command line — see the long
+#   note in the "Compile" step for why that breaks unrelated dependencies.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+  # Reused by release.yml so a tag push runs exactly the same build+verify
+  # pipeline that CI runs, instead of a second, drifting copy of it.
+  workflow_call:
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  OPENWRT_VERSION: '25.12.5'
+  SDK_BASE_URL: 'https://downloads.openwrt.org/releases/25.12.5/targets/x86/64'
+  SDK_FILE: 'openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst'
+  SDK_CACHE_DIR: '${{ github.workspace }}/.cache'
+  SDK_DIR: '${{ github.workspace }}/.sdk'
+  SDK_EXTRACTED: '${{ github.workspace }}/.sdk/openwrt-sdk'
+  # Directory in the checkout that scripts/feeds consumes as a feed root.
+  FEED_DIR: '${{ github.workspace }}/net'
+  FEED_NAME: 'oppackages'
+  ARTIFACT_DIR: '${{ github.workspace }}/tests/artifacts/apk'
+
+permissions:
+  contents: read
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Stage 1: static checks (no SDK, fast)
+  # ═══════════════════════════════════════════════════════════════════════
+  static-checks:
+    name: 1. Static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Makefile syntax + dep audit
+        run: |
+          ./tests/scripts/makefile-syntax.sh
+          ./tests/scripts/dep-audit.sh
+
+      - name: shellcheck all scripts and init files
+        run: ./tests/scripts/shellcheck-all.sh
+
+      - name: Init-script semantic validation (procd + UCI)
+        run: ./tests/scripts/validate-inits.sh
+
+      - name: PKG_HASH check (catch forgotten 'skip' values)
+        run: ./tests/scripts/hash-check.sh
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Stage 2: build every package directory against the OpenWrt 25.12.5 SDK
+  # ═══════════════════════════════════════════════════════════════════════
+  build:
+    name: 2. Build ${{ matrix.name }}
+    needs: static-checks
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: libreswan,            dir: libreswan }
+          - { name: strongswan,           dir: strongswan }
+          - { name: openvpn,              dir: openvpn }
+          - { name: openvpn-easy-rsa,     dir: openvpn-easy-rsa }
+          - { name: softethervpn,         dir: softethervpn }
+          - { name: softethervpn5,        dir: softethervpn5 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenWrt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              cpio \
+              file \
+              git \
+              gnupg \
+              libncurses-dev \
+              libssl-dev \
+              patch \
+              perl \
+              python3 \
+              python3-pyelftools \
+              rsync \
+              unzip \
+              wget \
+              xz-utils \
+              zlib1g-dev \
+              zstd
+          tar --version | head -1
+          zstd --version
+
+      - name: Cache the SDK tarball
+        uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: ${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}
+          key: openwrt-sdk-tarball-v2-${{ env.OPENWRT_VERSION }}-${{ env.SDK_FILE }}
+          restore-keys: |
+            openwrt-sdk-tarball-v2-${{ env.OPENWRT_VERSION }}-
+
+      - name: Download SDK tarball (only on cache miss)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          SDK_URL: '${{ env.SDK_BASE_URL }}/${{ env.SDK_FILE }}'
+        run: |
+          set -eux
+          mkdir -p '${{ env.SDK_CACHE_DIR }}'
+          wget "${SDK_URL}" -O '${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}'
+
+      - name: Extract SDK
+        run: |
+          set -eux
+          rm -rf '${{ env.SDK_DIR }}'
+          mkdir -p '${{ env.SDK_DIR }}'
+          tar -I zstd -xf '${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}' -C '${{ env.SDK_DIR }}'
+          shopt -s nullglob
+          for d in '${{ env.SDK_DIR }}'/openwrt-sdk-*; do
+              if [[ -d "${d}" ]]; then
+                  mv "${d}" '${{ env.SDK_EXTRACTED }}'
+                  break
+              fi
+          done
+          shopt -u nullglob
+          test -x '${{ env.SDK_EXTRACTED }}/scripts/feeds' \
+              || { echo "FATAL: scripts/feeds missing or not executable"; exit 1; }
+          test -d '${{ env.SDK_EXTRACTED }}/package' \
+              || { echo "FATAL: SDK package/ directory missing"; exit 1; }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Feed wiring.
+      #
+      # Three things have to be right here, and each one has bitten us:
+      #
+      #  a) The 25.12.5 SDK ships an essentially empty package/ tree. The
+      #     base packages arrive through the `base` src-git feed, and the
+      #     shared libraries we depend on (libcurl, libgcrypt, libsodium,
+      #     liblzo, liblz4, libpam, libcap-ng, libmysqlclient-r, libopenldap,
+      #     libsqlite3, bash, ...) arrive through the `packages` src-git
+      #     feed. Both are listed in feeds.conf.default and both have to be
+      #     kept, updated *and* installed, or every such DEPENDS is
+      #     unresolvable ("No feed for package 'libcurl'") and CMake reports
+      #     `LIB_READLINE-NOTFOUND`.
+      #
+      #  b) `scripts/feeds install <feedname>` only works when <feedname> is
+      #     a *package*. For a feed it prints
+      #        WARNING: No feed for package 'oppackages' found
+      #     and installs nothing, leaving package/feeds/oppackages/ absent
+      #     and every make target unknown. The supported spelling is
+      #        ./scripts/feeds install -a -p <feedname>
+      #
+      #  c) openwrt/packages ships its own libreswan/strongswan/openvpn/
+      #     openvpn-easy-rsa/softethervpn/softethervpn5. scripts/feeds never
+      #     replaces an already-installed source package (not even with -f),
+      #     so installing that feed first would silently build upstream code
+      #     instead of ours. Delete the clones and re-index before installing.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Wire up feeds
+        run: |
+          set -euo pipefail
+          cd '${{ env.SDK_EXTRACTED }}'
+
+          # (a) Keep the SDK's pinned `base` and `packages` feeds, drop the
+          #     rest, and add ours. `packages` is *required*: the SDK ships an
+          #     essentially empty package/ tree, and most of our DEPENDS
+          #     (libcurl, libgcrypt, libsodium, liblzo, liblz4, libpam,
+          #     libcap-ng, libmysqlclient-r, libopenldap, libsqlite3, bash,
+          #     kmod-ovpn-dco-v2, python3/host, ...) live in the `packages`
+          #     feed, not in `base`. With a base-only feeds.conf every one of
+          #     those resolves to "No feed for package '...'".
+          grep -E '^src-git --root=package base ' feeds.conf.default \
+              || { echo "FATAL: no pinned base feed in feeds.conf.default"; exit 1; }
+          grep -E '^src-git packages ' feeds.conf.default \
+              || { echo "FATAL: no pinned packages feed in feeds.conf.default"; exit 1; }
+          {
+              grep -E '^src-git --root=package base ' feeds.conf.default
+              grep -E '^src-git packages ' feeds.conf.default
+              echo 'src-link ${{ env.FEED_NAME }} ${{ env.FEED_DIR }}'
+          } > feeds.conf
+          echo "=== feeds.conf ==="
+          cat feeds.conf
+          echo
+
+          echo "=== feeds update -a ==="
+          if ! ./scripts/feeds update -a > /tmp/feeds-update.log 2>&1; then
+              tail -30 /tmp/feeds-update.log
+              exit 1
+          fi
+          tail -5 /tmp/feeds-update.log
+
+          # (c) Drop the upstream copies of the packages we provide.
+          for p in libreswan strongswan openvpn openvpn-easy-rsa \
+                   softethervpn softethervpn5; do
+              rm -rf "feeds/packages/net/${p}"
+          done
+          if ! ./scripts/feeds update -i packages > /tmp/feeds-reindex.log 2>&1; then
+              tail -30 /tmp/feeds-reindex.log
+              exit 1
+          fi
+          tail -3 /tmp/feeds-reindex.log
+
+          echo "=== feeds install -a ==="
+          if ! ./scripts/feeds install -a > /tmp/feeds-install.log 2>&1; then
+              tail -30 /tmp/feeds-install.log
+              exit 1
+          fi
+          tail -5 /tmp/feeds-install.log
+
+          # (b) Install *our* feed with the -p spelling.
+          echo "=== feeds install -a -p ${{ env.FEED_NAME }} ==="
+          if ! ./scripts/feeds install -a -p '${{ env.FEED_NAME }}' > /tmp/feeds-our.log 2>&1; then
+              tail -30 /tmp/feeds-our.log
+              exit 1
+          fi
+          tail -20 /tmp/feeds-our.log
+
+          echo
+          echo "=== package/feeds/${{ env.FEED_NAME }}/ ==="
+          ls -la 'package/feeds/${{ env.FEED_NAME }}/' \
+              || { echo "FATAL: oppackages feed was not installed"; exit 1; }
+
+      - name: Seed .config and run defconfig
+        run: |
+          set -euo pipefail
+          cd '${{ env.SDK_EXTRACTED }}'
+          cp '${{ github.workspace }}/tests/configs/sdk-minimal.config' .config
+          export TERM=dumb
+          # Trim the noise: the stock packages feed carries pre-existing
+          # recursive-dependency reports (nginx, asterisk, qemu, gensio,
+          # mutt, rsyslog) and hundreds of type-redefinition warnings that
+          # are upstream issues, unrelated to this repo. They must not be
+          # treated as build failures, so only the real errors are fatal.
+          set +e
+          make defconfig > /tmp/defconfig.log 2>&1
+          rc=$?
+          set -e
+          if [[ ${rc} -ne 0 ]]; then
+              echo "defconfig failed (rc=${rc})"
+              grep -vE "recursive dependency detected|symbol .* (depends on|is selected by)|^For a resolution refer|^subsection \"Kconfig" \
+                   /tmp/defconfig.log | tail -30 || true
+              exit ${rc}
+          fi
+          grep -E "warning: ignoring type redefinition" /tmp/defconfig.log | wc -l \
+              | awk '{print "redefinition warnings (upstream noise):", $1}'
+          grep -E "recursive dependency detected" /tmp/defconfig.log | wc -l \
+              | awk '{print "recursive dependency reports (upstream noise):", $1}'
+
+      - name: Compile ${{ matrix.name }}
+        run: |
+          set -uo pipefail
+          cd '${{ env.SDK_EXTRACTED }}'
+
+          mkdir -p '${{ env.ARTIFACT_DIR }}'
+          LOG='${{ github.workspace }}/tests/artifacts/${{ matrix.name }}-build.log'
+
+          # `include/package-bin.mk` only emits the `compile` target when
+          # the package is selected:
+          #     ifneq ($(CONFIG_PACKAGE_$(1))$(DEVELOPER),)
+          #         compile: install-bin-$(1)
+          # We select every package we build explicitly in
+          # tests/configs/sdk-minimal.config (all CONFIG_PACKAGE_*=y), so we
+          # must NOT pass DEVELOPER=1 here: that variable makes the condition
+          # true for *every* package in the tree, which drags the whole of
+          # package/toolchain into the build. That pulls in Package/libasan,
+          # whose install step does $(CP) $(TOOLCHAIN_DIR)/lib/libasan.so.* —
+          # and this is a musl SDK, so no libasan.so.* exists:
+          #     cp: cannot stat '.../lib/libasan.so.*': No such file or directory
+          #     ERROR: package/toolchain failed to build.
+          #
+          # Do NOT pass BUILD_VARIANT= either. It looks like the natural way
+          # to select one variant, but include/subdir.mk:75 treats it as a
+          # *global* override:
+          #     $(foreach variant,$(filter-out *,$(if $(BUILD_VARIANT),$(BUILD_VARIANT), ...
+          # It is applied while walking every directory, and subdir_make_opts
+          # re-exports it as BUILD_VARIANT="$(4)" into each recursive make.
+          # Because package.mk:11 keys the build directory off it
+          #     PKG_BUILD_DIR ?= $(BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)...
+          # every *dependency* got built as e.g. iproute2-default or
+          # openssl-openssl. iproute2 only knows iptiny/ipfull/tctiny/tcbpf/
+          # tcfull, so its `default` branch left LIBBPF_FORCE empty and
+          # configure printed its usage and exited 1:
+          #     --libbpf_force=      ->  Usage: ./configure [OPTIONS]
+          #     ERROR: package/feeds/base/iproute2 failed to build (build variant: default).
+          #
+          # The supported mechanism is per-directory: scripts/package-metadata.pl
+          # emits `$(curdir)/<path>/variants` from each package's `VARIANT:=`
+          # metadata, and subdir.mk walks exactly those. Compiling the whole
+          # directory therefore builds every *selected* variant with its own
+          # build dir — which is why the 3 openvpn backends and the 4
+          # softether* binaries all come out of a single directory compile.
+          set +e
+          make -j"$(nproc)" \
+               "package/feeds/${{ env.FEED_NAME }}/${{ matrix.dir }}/compile" \
+               V=s 2>&1 \
+              | tee "${LOG}" > /dev/null
+          rc="${PIPESTATUS[0]}"
+          set -e
+
+          if [[ "${rc}" -ne 0 ]]; then
+              echo "FATAL: make package/feeds/${{ env.FEED_NAME }}/${{ matrix.dir }}/compile exited ${rc}"
+              echo
+              echo "==== make: *** errors ===="
+              grep -nE "^(make(\[[0-9]+\])?: )?\*\*\*|Error [0-9]+" "${LOG}" | head -30 || true
+              echo
+              echo "==== last 40 significant lines ===="
+              # Drop the kconfig chatter: the stock openwrt/packages feed has
+              # pre-existing "recursive dependency detected" reports in nginx,
+              # asterisk, qemu, gensio, mutt and rsyslog. They are upstream
+              # issues, unrelated to this repo, and they bury the real error.
+              grep -vE "recursive dependency detected|symbol .* (depends on|is selected by)|^For a resolution refer|^subsection \"Kconfig|^$|ignoring type redefinition" "${LOG}" \
+                  | tail -40 || true
+              exit "${rc}"
+          fi
+          echo "make OK"
+
+      - name: Collect .apk artifacts
+        run: |
+          set -euo pipefail
+          cd '${{ env.SDK_EXTRACTED }}'
+          # Only our own feed. The old glob `bin/packages/*/*/*.apk` also
+          # matched the `base` feed, which drags ~160 unrelated packages
+          # (firmware blobs, libopenssl3, libnl*, ...) into the artifact set
+          # and into verify-pkg.sh. Every one of them then has to pass our
+          # package-specific checks, so a real failure in our own package is
+          # buried in noise and the job fails for reasons we do not own.
+          #
+          # Each directory compile also drops the shared dependencies it had
+          # to build (libcap-ng, liblz4, liblzo2, ...) into their own feed
+          # subdir; those are inputs, not deliverables, so they stay out too.
+          found=0
+          shopt -s nullglob
+          for art in bin/packages/*/"${{ env.FEED_NAME }}"/*.apk; do
+              cp -v "${art}" '${{ env.ARTIFACT_DIR }}/'
+              found=1
+          done
+          shopt -u nullglob
+          [[ "${found}" -eq 1 ]] || {
+              echo "FATAL: build succeeded but no .apk under bin/packages/*/${{ env.FEED_NAME }}"
+              find bin -name '*.apk' 2>/dev/null | head || true
+              exit 1
+          }
+          echo
+          ls -la '${{ env.ARTIFACT_DIR }}'
+
+      - name: Verify the .apk files with the SDK's own apk-tools
+        # OpenWrt 25.12 packages are apk-tools v3 "ADB" containers — a binary
+        # format that tar/unzip cannot read. The SDK ships the matching host
+        # binary at staging_dir/host/bin/apk, which is exactly what the device
+        # will use, so verify with that.
+        env:
+          APK_BIN: '${{ env.SDK_EXTRACTED }}/staging_dir/host/bin/apk'
+          ARTIFACT_DIR: '${{ env.ARTIFACT_DIR }}'
+        run: |
+          set -euo pipefail
+          test -x "${APK_BIN}" || { echo "FATAL: ${APK_BIN} missing"; exit 1; }
+          "${APK_BIN}" --version || true
+          ./tests/scripts/verify-pkg.sh
+
+      - name: Upload .apk artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.dir }}
+          path: ${{ env.ARTIFACT_DIR }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.name }}
+          path: tests/artifacts/${{ matrix.name }}-build.log
+          if-no-files-found: ignore
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Stage 3: functional verification of every built .apk
+  # ═══════════════════════════════════════════════════════════════════════
+  verify:
+    name: 3. Verify .apk
+    needs: build
+    runs-on: ubuntu-24.04
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Fetch the apk-tools v3 host binary
+        # Same cached tarball the build jobs used; we pull only the host
+        # apk-tools rather than the whole SDK.
+        uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: ${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}
+          key: openwrt-sdk-tarball-v2-${{ env.OPENWRT_VERSION }}-${{ env.SDK_FILE }}
+          restore-keys: |
+            openwrt-sdk-tarball-v2-${{ env.OPENWRT_VERSION }}-
+
+      - name: Download SDK tarball (only on cache miss)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          SDK_URL: '${{ env.SDK_BASE_URL }}/${{ env.SDK_FILE }}'
+        run: |
+          set -eux
+          mkdir -p '${{ env.SDK_CACHE_DIR }}'
+          wget "${SDK_URL}" -O '${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}'
+
+      - name: Extract just the host apk binary
+        run: |
+          set -euo pipefail
+          mkdir -p apktmp
+          # staging_dir/host/bin/apk is a wrapper script, not the real
+          # program: it execs a loader from ../lib and re-execs the actual
+          # binary stored beside it as .apk.bin. Extracting the visible
+          # "apk" name alone therefore yields something that cannot run, so
+          # take the whole host bin/ and lib/ directories. They are named as
+          # directory members (trailing slash) rather than with an "apk*"
+          # wildcard, because the file we actually need is a dotfile and
+          # wildcard matching of leading dots is not reliable.
+          tar -I zstd -xf '${{ env.SDK_CACHE_DIR }}/${{ env.SDK_FILE }}' -C apktmp \
+              --wildcards '*/staging_dir/host/bin/' '*/staging_dir/host/lib/'
+          APK="$(find apktmp -type f -path '*/staging_dir/host/bin/apk' -print -quit)"
+          test -n "${APK}" || { echo "FATAL: host apk not found in SDK"; exit 1; }
+          test -f "$(dirname "${APK}")/.apk.bin" || {
+              echo "FATAL: host apk real binary .apk.bin not extracted"; exit 1; }
+          chmod +x "${APK}" "$(dirname "${APK}")/.apk.bin"
+          # Fail here, once, if the tool is not actually runnable, instead of
+          # reporting 100+ bogus per-package verification failures.
+          "${APK}" --version || {
+              echo "FATAL: host apk is not runnable"; exit 1; }
+          echo "APK_BIN=${APK}" >> "$GITHUB_ENV"
+
+      - name: Inventory
+        run: |
+          set -euo pipefail
+          echo "=== collected packages ==="
+          find dist -type f -name '*.apk' -printf '%f\n' | sort
+          echo
+          echo "count: $(find dist -type f -name '*.apk' | wc -l)"
+
+      - name: Run package functional checks
+        env:
+          ARTIFACT_DIR: '${{ github.workspace }}/dist'
+        run: ./tests/scripts/verify-pkg.sh
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Stage 4: weekly upstream version watch
+  # ═══════════════════════════════════════════════════════════════════════
+  upstream-watch:
+    name: 4. Upstream version watch (weekly)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare upstream vs local versions
+        run: ./tests/scripts/upstream-check.sh | tee tests/artifacts/upstream-versions.log
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-versions
+          path: tests/artifacts/upstream-versions.log
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Stage 5: CI summary
+  # ═══════════════════════════════════════════════════════════════════════
+  summary:
+    name: 5. CI summary
+    runs-on: ubuntu-24.04
+    needs: [static-checks, build, verify, upstream-watch]
+    if: always()
+    steps:
+      - name: Print job results
+        run: |
+          echo "static-checks:  ${{ needs.static-checks.result }}"
+          echo "build:          ${{ needs.build.result }}"
+          echo "verify:         ${{ needs.verify.result }}"
+          echo "upstream-watch: ${{ needs.upstream-watch.result }}"
+          if [[ "${{ needs.verify.result }}" != "success" ]]; then
+              echo "::warning::Some functional verifications failed. See the 'verify' job."
+          fi
